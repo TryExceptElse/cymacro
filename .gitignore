@@ -1,0 +1,6 @@
+# expanded files
+test/.cache/*
+
+*cache/*
+*build/*
+*dist/*

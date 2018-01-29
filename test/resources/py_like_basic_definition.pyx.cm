@@ -1,0 +1,5 @@
+"""
+Test file. This module is not used, nor intended to be executed.
+"""
+
+TEST_VALUE = macro('1234')

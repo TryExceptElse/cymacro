@@ -1,0 +1,7 @@
+"""
+Test file. This module is not used, nor intended to be executed.
+"""
+
+FOO = macro("""def foo():
+    print('stuff')
+""")

@@ -1,0 +1,441 @@
+"""
+Module handling macros in python / cython files
+
+Intended to offer limited pre-processing for cython files.
+"""
+import collections as collect
+import os
+import string
+from distutils.core import Extension
+
+EXPANDED_FILE_SUFFIX = '_exp_'
+
+MAX_IDENTIFIER_LEN = 63  # same as C standard
+DEFINE_KWD = '#define', '# define'  # used for c-like definitions
+MACRO_KWD = 'macro('  # used for python-syntax obeying macro definition
+
+START_BRACKETS = '([{<'
+END_BRACKETS = ')]}>'
+BRACKETS = '()[]{}<>'
+QUOTE_MARKS = '\'"'
+INDENTS = '\t '
+
+kwd_actions = {}
+
+# todo ExtExpCol
+
+
+class ExtensionExpander:
+    def __init__(self, ext: Extension):
+        self.ext = ext
+        self.file_expanders = []
+        self.used = False
+        self.definitions = {}
+
+    def __call__(self, **kwargs):
+        """
+        Expands a single extension
+        :param ext: Extension
+        :param kwargs:
+        :return: None
+        """
+        for src in self.ext.sources:
+            out_base, f_ext = os.path.splitext(src)
+            out_path = out_base + EXPANDED_FILE_SUFFIX + f_ext
+            self.definitions.update(self._expand_path(
+                path=src, o=out_path, definitions=self.definitions))
+
+    def _expand_path(
+            self,
+            path: str,
+            o=None,
+            definitions: dict=None,
+            **kwargs) -> dict:
+        definitions = definitions or {}
+        with open(path, 'r+') as f:
+            expander = FileExpander(f, o, definitions, **kwargs)
+            self.file_expanders.append(expander)
+            return expander()
+
+
+class FileExpander:
+    """
+    Handles expansion of macros in a passed file
+    """
+    def __init__(self, f, o=None, definitions=None, **kwargs):
+        # validate
+        # if o and os.path.exists(o):
+        #     raise ValueError('Path already exists: {}'.format(o))
+        self.f = f
+        self.o = o
+        self.definitions = definitions or {}
+        self.kwargs = kwargs
+        self.used = False
+        self.content = f.read()
+        self.expanded_content = None
+        self._sub_expanders = []  # expanders used on included files
+
+    @classmethod
+    def from_path(cls, path, o=None, definitions=None, **kwargs):
+        with open(path, 'r+') as f:
+            return cls(f, o, definitions, **kwargs)
+
+    def __call__(self) -> dict:
+        """
+        Expands macros in passed file
+        :return: dict of definitions found in file
+        """
+        # read in file
+        self.expanded_content = self._parse_source(self.content)
+        self._write_expanded_file()
+        self.used = True
+        return self.definitions
+
+    def _write_expanded_file(self):
+        if self.o is None:
+            print('\n', self.expanded_content, '\n')
+        else:
+            with open(self.o, 'w+') as f:
+                f.write(self.expanded_content)
+
+    def _parse_source(self, s: str) -> str:
+        i = 0
+        result = ''
+        while i < len(s):
+            c = s[i]
+            start_index = i
+            # skip sections of code that cannot contain macros / kwd
+            if c in QUOTE_MARKS:
+                i = parse_to_quote_end(s, i)
+                result += s[start_index:i + 1]
+            elif c in '\\':
+                i = parse_to_line_end(s, i)
+                result += s[start_index:i + 1]
+
+            # check if a kwd has been found
+            for kwd in kwd_actions:
+                if s[i:i + len(kwd)] == kwd:
+                    kwd_action_ = kwd_actions[kwd]
+                    action_result, i = \
+                        kwd_action_.func(s, i, self.definitions)
+                    result += action_result
+                    break
+
+            # if c is not the start of a kwd, check if c is a comment
+            if i == start_index and c == '#':
+                i = parse_to_line_end(s, i)
+                result += s[start_index:i]
+
+            # otherwise, check if a macro identifier has been found
+            for identifier in self.definitions:
+                if s[i:i + len(identifier)] == identifier:
+                    macro_ = self.definitions[identifier]
+                    macro_content = macro_.expand(s, i)
+                    # parse new expanded text for content themselves
+                    expanded_text = self._parse_source(macro_content)
+                    result += expanded_text
+                    # skip index ahead
+                    i += len(macro_.ident) - 1
+                    break
+
+            # otherwise, add char to resulting str
+            if i == start_index:
+                result += c
+
+            i += 1
+        return result
+
+    def _expand_line(self, line: str) -> str:
+        # look for macro uses in line
+        for ident in self.definitions:
+            if ident in line:  # 'in' is ~2x faster than 'find'
+                index = line.find(ident)
+                new_line = self.definitions[ident].expand(line, index)
+                return self._expand_line(new_line)
+        else:
+            return line  # nothing to expand
+
+    def clean(self):
+        if self.o is not None:
+            os.remove(self.o)
+    
+
+class Macro:
+    """
+    Stores information about a macro.
+
+    Intended to be used internally only,
+    not referenced from outside cymacro.
+    """
+    def __init__(self, ident: str, body: str):
+        self.ident = ident
+        self.body = body
+        self.is_multiline = '\n' in body
+
+    def expand(self, s: str, pos: int) -> str:
+        """
+        Expands macro in passed line at passed position
+        :param s: str
+        :param pos: integer index
+        :return: new line with expanded macro
+        """
+        if not s[pos:].startswith(self.ident):
+            raise ValueError('{}\nMacro {} is not used at index {}'
+                             .format(s, self.ident, pos))
+        if self.is_multiline:
+            indent_qty = self._find_indent(s, pos)
+            indents = s[pos - indent_qty:pos]
+            body_lines = self.body.split('\n')
+            assert len(body_lines) > 1
+            adapted_body_lines = [body_lines[0]]
+            for b_line in body_lines[1:]:
+                adapted_body_lines.append(indents + b_line)
+            content = '\n'.join(adapted_body_lines)
+        else:
+            content = self.body
+        return content
+
+    @staticmethod
+    def _find_indent(s: str, pos: int) -> int:
+        i = 0
+        while s[pos - 1 - i] in INDENTS:
+            i += 1
+        return i
+
+
+KwdAction = collect.namedtuple('KwdAction', ('name', 'func'))
+
+
+def kwd_action(name: str or list):
+    """
+    Returns a decorator to be applied to a function to add it to the
+    dictionary of keyword actions.
+
+
+    The passed function will be called with (source, int index, definitions)
+
+    source is the string containing the keyword
+    index is the index of the first character of the keyword in source
+    definitions is the current dictionary of macro definitions
+
+    The function is expected to return the string that will replace the
+    kwd, and the index at which parsing should resume.
+    :param name: str or list[str]
+    :return: decorator
+    """
+    if isinstance(name, str):
+        name = [name]
+    else:
+        if not isinstance(name, (list, set, tuple)) or \
+                not all([isinstance(i, str) for i in name]):
+            raise ValueError('Expected str, or collection of str')
+
+    def decorator(func):
+        for name_ in name:
+            kwd_actions[name_] = KwdAction(name_, func)
+
+        return func  # no changes made to function
+
+    return decorator
+
+
+def expand_path(path: str, o=None, definitions=None, **kwargs) -> dict:
+    with open(path, 'r+') as f:
+        return expand_file(f, o, definitions, **kwargs)
+
+
+def expand_file(f, o=None, definitions=None, **kwargs) -> dict:
+    """
+    Expands macros in passed file
+    :param f: file to expand.
+    :param o: out file. If none passed, sends expanded text to stdout.
+    :param definitions: dictionary of pre-defined definitions.
+    """
+    expander = FileExpander(f, o, definitions, **kwargs)
+    return expander()
+    
+    
+# utility methods
+
+
+def parse_to_bracket_end(s: str, start_index: int) -> int:
+    """
+    Continues parsing to end of bracket, returns
+    :param s: string containing brackets to parse
+    :param start_index: index of starting bracket
+    :return: index of end bracket
+    """
+    start_bracket = s[start_index]
+    if start_bracket not in START_BRACKETS:
+        raise ValueError('{} is not a starting bracket'
+                         .format(start_bracket))
+    end_bracket = END_BRACKETS[START_BRACKETS.find(start_bracket)]
+
+    i = start_index + 1
+    while True:
+        c = s[i]
+        if c in '\'"':  # if c is a quote mark
+            i = parse_to_quote_end(s, i)
+        elif c == start_bracket:
+            # another level of bracket has been encountered
+            i = parse_to_bracket_end(s, i)
+        elif c == end_bracket:
+            return i
+        i += 1
+
+
+def parse_to_quote_end(s: str, start_index: int) -> int:
+    """
+    Continues parsing to end of quote segment identified by
+    starting index
+    :param s: string containing text to be parsed
+    :param start_index: int index of starting quote mark
+    :return: end index
+    """
+    start_mark = s[start_index]
+    if start_mark not in QUOTE_MARKS:
+        raise ValueError('{} is not a starting quote mark'
+                         .format(start_mark))
+
+    i = start_index
+    # handle quotes different if quotes are single or triple
+    if s[i:i+3] == "'''" or s[i:i+3] == '"""':
+        start = s[i:i+3]
+        i = start_index + 3
+        while True:
+            c3 = s[i:i+3]
+            if c3 == start and s[i - 1] != '\\':
+                return i + 2  # return index of last quote
+            i += 1
+    else:
+        i += 1
+        while True:
+            c = s[i]
+            if c == start_mark and s[i - 1] != '\\':
+                return i
+            i += 1
+
+
+def parse_to_line_end(s, start_index: str):
+    """
+    Continues to line end
+    :param s: source string
+    :param start_index: index at which to start parsing
+    :return: index of line end.
+    """
+    i = start_index
+    last_index = len(s)
+    while True:
+        c = s[i]
+        if c == '\n':
+            return i
+        if c == last_index:
+            return i
+        i += 1
+
+
+# predefined kwd actions. can be expanded upon by users
+
+
+@kwd_action(DEFINE_KWD)
+def define_c_like_macro(source: str, index: int, definitions: dict) -> tuple:
+    for kwd in DEFINE_KWD:
+        if source[index:].startswith(kwd):
+            index += len(kwd)
+            break
+    else:
+        raise ValueError(
+            '{}...\nIdentified source position does not seem'
+            'to contain a macro definition.'
+            .format(source[index:index + 40])
+        )
+
+    # parse to the end of the macro and take a slice
+    definition = ''
+    i = index
+    while True:
+        c = source[i]
+        char_i = i
+        if c in START_BRACKETS:
+            i = parse_to_bracket_end(source, i)
+            definition += source[char_i:i + 1]
+        elif c in QUOTE_MARKS:
+            i = parse_to_quote_end(source, i)
+            definition += source[char_i:i + 1]
+        elif c == '#':
+            i = parse_to_line_end(source, i)
+            definition += source[char_i:i + 1]
+            # line has ended without a return char
+            break
+        elif c == '\\':
+            # If double backslashes, don't treat it as line end,
+            # just put a backslash in macro definition.
+            # otherwise, backslash indicates that the macro continues.
+            if source[i + 1] == '\\':
+                definition += '\\'
+                i += 1  # skip next backslash
+            else:
+                i = parse_to_line_end(source, i)
+                definition += '\n'
+                # add remaining characters of line
+
+        elif c == '\n':
+            # line has ended without a backslash char
+            break
+        else:
+            definition += c
+        i += 1
+    
+    # consider first word after define kwd to be the macro identifier
+    identifier, body = definition.lstrip().split(None, 1)  # split only once
+    body = body.lstrip()
+
+    # add definition to definitions dict
+    definitions[identifier] = Macro(identifier, body)
+
+    return '', i  # macro definition can be left completely out in expanded src
+
+
+@kwd_action(MACRO_KWD)
+def define_py_like_macro(source: str, index: int, definitions: dict) -> tuple:
+
+    # get body
+    i = body_start = index + len(MACRO_KWD)
+    if not source[i] in QUOTE_MARKS:
+        raise ValueError(
+            'macro() does not contain a string'
+            .format(source[i - 20: i + 20])
+        )
+
+    i = parse_to_quote_end(source, i) + 1
+    body = eval(source[body_start:i])  # todo: replace eval
+    definition_end = i
+
+    assert source[definition_end] == ')'
+
+    # get identifier
+    # note: if there is a simpler/more robust way to replace this,
+    #       that'd be good.
+
+    # parse backwards from macro() call to find equal sign
+    i = index - 1
+    while source[i] != '=':
+        i -= 1
+
+    # now parse backwards further looking for identifier
+    while source[i - 1] in string.whitespace or i == '\\':
+        i -= 1
+
+    identifier_end = i
+    # assume identifier has been found
+    while source[i - 1] not in string.whitespace:
+        i -= 1
+
+    ident = source[i:identifier_end]
+
+    if not ident or \
+            not any(letter in ident for letter in string.ascii_letters):
+        raise ValueError('Not a valid identifier: {}'.format(ident))
+    definitions[ident] = Macro(ident, body)  # add definition
+
+    return '', definition_end

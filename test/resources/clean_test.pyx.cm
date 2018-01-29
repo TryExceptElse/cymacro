@@ -1,0 +1,6 @@
+"""
+Test file. This module is not used, nor intended to be executed.
+"""
+
+def indented_block():
+    FOO
